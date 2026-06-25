@@ -1,0 +1,143 @@
+import os
+import json
+import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import pandas as pd
+import openai
+
+# 1. File and Email Configuration
+STARTUPS_FILE = "startups.csv"
+AMBASSADORS_FILE = "ambassador_companies_contacts.csv"
+STATE_FILE = "match_state.json"
+TARGET_EMAIL = "team2@techbuffalo.org"
+
+# Secure credentials fetched from environment variables
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.sendgrid.net")  # or smtp.gmail.com
+SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+openai.api_key = os.environ.get("OPENAI_API_KEY")
+
+def get_todays_startup_row(total_rows):
+    """Tracks rows sequentially so John gets exactly 1 new startup per day."""
+    if not os.path.exists(STATE_FILE):
+        state = {"last_index": -1, "last_date": ""}
+    else:
+        with open(STATE_FILE, 'r') as f:
+            state = json.load(f)
+            
+    # Calculate next index, looping back to 0 if we hit the end of the list
+    next_index = (state["last_index"] + 1) % total_rows
+    
+    state["last_index"] = next_index
+    state["last_date"] = datetime.datetime.now().strftime("%Y-%m-%d")
+    
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+        
+    return next_index
+
+def run_matchmaking_engine():
+    # Load files safely
+    startups_df = pd.read_csv(STARTUPS_FILE)
+    ambassadors_df = pd.read_csv(AMBASSADORS_FILE)
+    
+    # 2. Get today's designated startup
+    row_idx = get_todays_startup_row(len(startups_df))
+    startup = startups_df.iloc[row_idx].to_dict()
+    
+    # Compress ambassador profiles slightly to save AI token space
+    ambassador_pool = ambassadors_df[['Company Name', 'Website', 'Contact Name', 'Title', 'Email', 'Industry', 'Description']].to_dict(orient='records')
+    
+    # 3. Construct the matching prompt for the AI
+    prompt = f"""
+    You are an elite corporate matchmaker working alongside John at 43North. Your goal is to review a local startup's target profile and find its absolute best strategic matches out of our Buffalo Ambassador Network.
+
+    TODAY'S FEATURED STARTUP:
+    - Name: {startup.get('company_name', 'N/A')}
+    - URL: {startup.get('company_url', 'N/A')}
+    - What they do: {startup.get('plain_english_description', startup.get('company_description', 'N/A'))}
+    - Value Proposition: {startup.get('value_proposition', 'N/A')}
+    - Target ICP Target Industry: {startup.get('icp_industry', 'N/A')}
+    - Target Company Size: {startup.get('icp_company_size', 'N/A')}
+
+    AMBASSADOR CORPORATE POOL:
+    {json.dumps(ambassador_pool, indent=2)}
+
+    TASK:
+    Analyze the Startup's attributes and find the top 3 best fits out of the Ambassador Pool. 
+    For each of the 3 matches, output exactly:
+    1. Ambassador Company Name & Contact Info (Name, Title, Email from the data).
+    2. Match Type: Either [CUSTOMER MATCH] or [INVESTOR MATCH].
+    3. Strategic Match Reason: 2 sentences explaining why this makes commercial sense.
+    4. Suggested Intro Email Sentence: A quick copy-paste opener John can use.
+
+    Keep your final output exceptionally clean, clear, and professional for an executive audience.
+    """
+
+    # Call AI to process the complex matching logic
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a professional venture ecosystem matching engine."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    
+    ai_analysis = response.choices[0].message.content
+    send_match_email(startup, ai_analysis)
+
+def send_match_email(startup, ai_analysis):
+    subject = f"🎯 Daily Match: {startup.get('company_name')} x Buffalo Ambassador Network"
+    
+    # Premium styled HTML container layout
+    html_content = f"""
+    <html>
+    <body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6; max-width: 650px; margin: 0 auto; padding: 20px;">
+        <div style="background-color: #1e3a8a; color: white; padding: 25px; text-align: center; border-radius: 6px 6px 0 0;">
+            <h1 style="margin: 0; font-size: 24px;">43North Matchmaking Engine</h1>
+            <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.9;">Automated Ecosystem Recommendations for John</p>
+        </div>
+        <div style="padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 6px 6px; background-color: #ffffff;">
+            <h2 style="color: #1e3a8a; margin-top: 0;">🔥 Today's Feature Startup: <a href="{startup.get('company_url','')}" style="color: #2563eb; text-decoration: none;">{startup.get('company_name')}</a></h2>
+            <p style="background-color: #f8fafc; padding: 12px; border-left: 4px solid #3b82f6; font-style: italic;">
+                "{startup.get('plain_english_description', startup.get('company_description', ''))}"
+            </p>
+            <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr><td style="padding: 6px 0; font-weight: bold; width: 140px;">Value Prop:</td><td>{startup.get('value_proposition','')}</td></tr>
+                <tr><td style="padding: 6px 0; font-weight: bold;">Ideal Client Type:</td><td>{startup.get('icp_industry','')}</td></tr>
+            </table>
+            
+            <hr style="border: 0; border-top: 1px solid #e5e7eb; margin: 25px 0;">
+            
+            <h3 style="color: #0f172a; margin-bottom: 15px;">🤝 Top Curated Matches</h3>
+            <div style="white-space: pre-wrap; background-color: #fafafa; padding: 15px; border-radius: 4px; font-size: 14px; border: 1px solid #f0f0f0;">
+{ai_analysis}
+            </div>
+            
+            <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 35px; border-top: 1px solid #f3f4f6; padding-top: 15px;">
+                This is a fully automated morning report sent to <strong>{TARGET_EMAIL}</strong>. The pipeline will automatically cycle to the next startup profile tomorrow morning.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    msg = MIMEMultipart()
+    msg['From'] = f"43North Match Engine <{SMTP_USER}>"
+    msg['To'] = TARGET_EMAIL
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html_content, 'html'))
+    
+    # Connect and transmit securely via TLS
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, TARGET_EMAIL, msg.as_string())
+    print(f"Daily match successfully emailed for {startup.get('company_name')}!")
+
+if __name__ == "__main__":
+    run_matchmaking_engine()
